@@ -1,0 +1,4 @@
+.env
+.tazkarti_seen_matches.json
+__pycache__/
+*.pyc
