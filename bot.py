@@ -127,6 +127,7 @@ STATE: dict[str, Any] = {
     "last_error": None,
     "checks": 0,
     "matches_sent": 0,
+    "closed_sent": 0,
 }
 
 
@@ -150,7 +151,6 @@ def json_request(url: str) -> Any:
 
 
 def nested_values(value: Any) -> list[Any]:
-    """Flatten nested JSON values for tolerant API field extraction."""
     if isinstance(value, dict):
         values: list[Any] = list(value.values())
         for child in value.values():
@@ -436,7 +436,6 @@ def telegram_messages(message: str) -> bool:
 
 
 def telegram_command_loop() -> None:
-    """Receive basic bot commands through Telegram long polling."""
     if not TELEGRAM_COMMANDS_ENABLED:
         LOGGER.info("Telegram command listener is disabled.")
         return
@@ -477,7 +476,7 @@ def telegram_command_loop() -> None:
                     reply = (
                         "👋 <b>أهلًا بيك في نشرة تذكرتي</b>\n\n"
                         "✨ أنا هتابع لك مباريات الأهلي والزمالك، "
-                        "وأبعت لك التنبيه أول ما الحجز يفتح.\n\n"
+                        "وأبعت لك التنبيه أول ما الحجز يفتح أو يقفل.\n\n"
                         "📌 <b>الأوامر المتاحة</b>\n"
                         "• /status — معرفة حالة المراقبة\n"
                         "• /help — عرض هذه الرسالة"
@@ -490,7 +489,8 @@ def telegram_command_loop() -> None:
                         f"الحالة: {status_text}\n"
                         f"آخر فحص ناجح: {html.escape(str(last_check))}\n"
                         f"عدد الفحوصات: {state['checks']}\n"
-                        f"التنبيهات المنشورة: {state['matches_sent']}"
+                        f"تنبيهات الفتح المُرْسَلة: {state['matches_sent']}\n"
+                        f"تنبيهات الغلق المُرْسَلة: {state.get('closed_sent', 0)}"
                     )
                 else:
                     continue
@@ -507,19 +507,26 @@ def telegram_command_loop() -> None:
             STOP_EVENT.wait(5)
 
 
-def load_seen_matches() -> set[str]:
+def load_seen_matches() -> dict[str, Any]:
     try:
         with open(SEEN_MATCHES_FILE, encoding="utf-8") as file:
             data = json.load(file)
-        return {str(item) for item in data if item}
+        
+        if isinstance(data, list):
+            return {str(item): {"status": "closed", "title": "مباراة سابقة"} for item in data if item}
+        
+        if isinstance(data, dict):
+            return data
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return set()
+        pass
+    return {}
 
 
-def save_seen_matches(seen: set[str]) -> None:
+def save_seen_matches(seen: dict[str, Any]) -> None:
     try:
         with open(SEEN_MATCHES_FILE, "w", encoding="utf-8") as file:
-            json.dump(sorted(seen)[-2000:], file, ensure_ascii=False, indent=2)
+            items = list(seen.items())[-2000:]
+            json.dump(dict(items), file, ensure_ascii=False, indent=2)
     except OSError as error:
         LOGGER.warning("Could not save seen matches: %s", error)
 
@@ -605,7 +612,7 @@ def build_match_message(match: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def check_tazkarti(seen_matches: set[str]) -> None:
+def check_tazkarti(seen_matches: dict[str, Any]) -> None:
     now = utc_now()
     with STATE_LOCK:
         STATE["last_check_at"] = now
@@ -618,23 +625,56 @@ def check_tazkarti(seen_matches: set[str]) -> None:
         if not isinstance(matches, list):
             raise RuntimeError("Unexpected matches response shape")
 
-        new_matches = [
-            match
-            for match in matches
-            if isinstance(match, dict)
-            and match_id(match)
-            and contains_target_team(match)
-            and match_id(match) not in seen_matches
-        ]
+        active_matches = {
+            match_id(m): m
+            for m in matches
+            if isinstance(m, dict) and match_id(m)
+        }
 
-        for match in new_matches:
-            identifier = match_id(match)
-            if telegram_messages(build_match_message(match)):
-                seen_matches.add(identifier)
-                with STATE_LOCK:
-                    STATE["matches_sent"] += 1
-                save_seen_matches(seen_matches)
-                LOGGER.info("Published new match %s", identifier)
+        # 1. Process New Matches
+        for identifier, match in active_matches.items():
+            if contains_target_team(match):
+                if identifier not in seen_matches:
+                    names = extract_team_names(match)
+                    title = " 🆚 ".join(names) if len(names) >= 2 else match_title(match)
+                    
+                    if telegram_messages(build_match_message(match)):
+                        seen_matches[identifier] = {"status": "open", "title": title}
+                        with STATE_LOCK:
+                            STATE["matches_sent"] += 1
+                        save_seen_matches(seen_matches)
+                        LOGGER.info("Published new match %s", identifier)
+
+        # 2. Check previously open matches for closure
+        if active_matches:  # Ensure we have data to avoid false closing
+            for identifier, info in list(seen_matches.items()):
+                if info.get("status") == "open":
+                    is_closed = False
+                    
+                    if identifier not in active_matches:
+                        is_closed = True
+                    else:
+                        tickets = get_ticket_details(identifier)
+                        if tickets:
+                            target_tickets = [
+                                t for t in tickets 
+                                if int_value(first_value(t, "teamId", "teamID", "team_id")) in TARGET_TEAM_IDS
+                            ]
+                            if target_tickets:
+                                is_closed = all(t.get("soldOut") is True for t in target_tickets)
+                            else:
+                                is_closed = all(t.get("soldOut") is True for t in tickets)
+                    
+                    if is_closed:
+                        title = info.get("title", "مباراة غير معروفة")
+                        closed_msg = f"❌ <b>تم غلق الحجز</b>\n\n<b>{html.escape(title)}</b>"
+                        
+                        if telegram_messages(closed_msg):
+                            seen_matches[identifier]["status"] = "closed"
+                            with STATE_LOCK:
+                                STATE["closed_sent"] += 1
+                            save_seen_matches(seen_matches)
+                            LOGGER.info("Published closed match %s", identifier)
 
         with STATE_LOCK:
             STATE["last_success_at"] = utc_now()
