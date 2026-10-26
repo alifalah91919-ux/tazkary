@@ -135,6 +135,26 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def format_egypt_time(iso_str: str | None) -> str:
+    """Formats an ISO UTC datetime string to Egyptian Time for /status"""
+    if not iso_str:
+        return "لم يتم بعد"
+    try:
+        parsed = datetime.fromisoformat(iso_str)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        # Convert to Egypt timezone
+        parsed = parsed.astimezone(ZoneInfo("Africa/Cairo"))
+        
+        # Format am/pm in arabic
+        hour = parsed.hour % 12 or 12
+        period = "صباحًا" if parsed.hour < 12 else "مساءً"
+        
+        return f"{parsed.year}-{parsed.month:02d}-{parsed.day:02d} {hour:02d}:{parsed.minute:02d}:{parsed.second:02d} {period}"
+    except ValueError:
+        return str(iso_str)
+
+
 def json_request(url: str) -> Any:
     request = Request(
         url,
@@ -328,9 +348,10 @@ def format_date(value: Any) -> str:
         return text
 
 
-def get_ticket_details(match_identifier: str) -> list[dict[str, Any]]:
+def get_ticket_details(match_identifier: str) -> list[dict[str, Any]] | None:
+    """Returns a list of tickets, or None if the request failed/timed out."""
     if not match_identifier:
-        return []
+        return None
 
     cache_buster = int(time.time() * 1000)
     url = f"{TICKETS_URL.format(match_identifier)}?_={cache_buster}"
@@ -342,16 +363,20 @@ def get_ticket_details(match_identifier: str) -> list[dict[str, Any]]:
         return data if isinstance(data, list) else []
     except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError):
         LOGGER.info("Ticket details unavailable for match %s", match_identifier)
-        return []
+        return None # Return None to indicate request failure, not just an empty list
 
 
 def available_tickets(match_identifier: str) -> list[str]:
     results: list[str] = []
-    for ticket in get_ticket_details(match_identifier):
+    tickets = get_ticket_details(match_identifier)
+    if tickets is None:
+        return []
+        
+    for ticket in tickets:
         team_id = int_value(
             first_value(ticket, "teamId", "teamID", "team_id")
         )
-        if team_id not in TARGET_TEAM_IDS or ticket.get("soldOut") is True:
+        if team_id not in TARGET_TEAM_IDS or ticket.get("soldOut") is True or int_value(ticket.get("availableSeats", -1)) == 0:
             continue
         category = str(
             first_value(ticket, "categoryNameAr", "categoryName", "name")
@@ -483,11 +508,11 @@ def telegram_command_loop() -> None:
                     )
                 elif command == "/status":
                     status_text = "يعمل بشكل طبيعي" if state["last_success_at"] else "ينتظر أول فحص"
-                    last_check = state["last_success_at"] or "لم يتم بعد"
+                    last_check = format_egypt_time(state["last_success_at"])
                     reply = (
                         "<b>حالة مراقب تذكرتي</b>\n"
                         f"الحالة: {status_text}\n"
-                        f"آخر فحص ناجح: {html.escape(str(last_check))}\n"
+                        f"آخر فحص ناجح: {last_check}\n"
                         f"عدد الفحوصات: {state['checks']}\n"
                         f"تنبيهات الفتح المُرْسَلة: {state['matches_sent']}\n"
                         f"تنبيهات الغلق المُرْسَلة: {state.get('closed_sent', 0)}"
@@ -652,18 +677,30 @@ def check_tazkarti(seen_matches: dict[str, Any]) -> None:
                     is_closed = False
                     
                     if identifier not in active_matches:
+                        # Match completely removed from the site
                         is_closed = True
                     else:
+                        # Match is still on site, let's check its tickets
                         tickets = get_ticket_details(identifier)
-                        if tickets:
-                            target_tickets = [
-                                t for t in tickets 
-                                if int_value(first_value(t, "teamId", "teamID", "team_id")) in TARGET_TEAM_IDS
-                            ]
-                            if target_tickets:
-                                is_closed = all(t.get("soldOut") is True for t in target_tickets)
+                        if tickets is not None: # Ensure the request was successful
+                            if len(tickets) == 0:
+                                # Booking closed (tickets removed from match details)
+                                is_closed = True
                             else:
-                                is_closed = all(t.get("soldOut") is True for t in tickets)
+                                # Check if specific tickets are sold out
+                                target_tickets = [
+                                    t for t in tickets 
+                                    if int_value(first_value(t, "teamId", "teamID", "team_id")) in TARGET_TEAM_IDS
+                                ]
+                                
+                                # A ticket is considered closed if explicitly soldOut OR availableSeats is 0
+                                def is_ticket_sold_out(t: dict[str, Any]) -> bool:
+                                    return t.get("soldOut") is True or int_value(t.get("availableSeats", -1)) == 0
+
+                                if target_tickets:
+                                    is_closed = all(is_ticket_sold_out(t) for t in target_tickets)
+                                else:
+                                    is_closed = all(is_ticket_sold_out(t) for t in tickets)
                     
                     if is_closed:
                         title = info.get("title", "مباراة غير معروفة")
