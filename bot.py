@@ -363,7 +363,7 @@ def get_ticket_details(match_identifier: str) -> list[dict[str, Any]] | None:
         return data if isinstance(data, list) else []
     except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError):
         LOGGER.info("Ticket details unavailable for match %s", match_identifier)
-        return None # Return None to indicate request failure, not just an empty list
+        return None  # Return None to indicate request failure, not just an empty list
 
 
 def available_tickets(match_identifier: str) -> list[str]:
@@ -679,8 +679,11 @@ def check_tazkarti(seen_matches: dict[str, Any]) -> None:
                     if identifier not in active_matches:
                         # Match completely removed from the site
                         is_closed = True
+                    elif int_value(active_matches[identifier].get("matchStatus")) == 3:
+                        # Match is still on the site, but its status changed to 3 (Closed)
+                        is_closed = True
                     else:
-                        # Match is still on site, let's check its tickets
+                        # Match is still on site (matchStatus is not 3), check tickets as fallback
                         tickets = get_ticket_details(identifier)
                         if tickets is not None: # Ensure the request was successful
                             if len(tickets) == 0:
